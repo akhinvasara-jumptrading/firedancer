@@ -103,6 +103,53 @@ struct fd_net_flusher {
 
 typedef struct fd_net_flusher fd_net_flusher_t;
 
+/* Metadata describing a TX operation */
+typedef struct {
+  uint   xsk_idx;
+  uchar  mac_addrs[12];     /* First 12 bytes of Ethernet header */
+  uint   src_ip;            /* src_ip in net order */
+
+  uint   use_gre;           /* The tx packet will be GRE-encapsulated */
+  uint   gre_outer_src_ip;  /* For GRE: Outer iphdr's src_ip in net order */
+  uint   gre_outer_dst_ip;  /* For GRE: Outer iphdr's dst_ip in net order */
+} fd_route_decision_t;
+
+union fd_net_route_cache_key {
+  struct {
+    uint rtype;
+    uint if_idx;
+  };
+  ulong key;
+};
+
+typedef union fd_net_route_cache_key fd_net_route_cache_key_t;
+
+struct fd_net_route_cache {
+  /* This cache increases throughput
+     for the pktgen tool by about 25%. pktgen has a ~100% hit
+     rate, so we expect the improvement to be smaller in production.
+     Increasing the cache size is likely not worth
+     the additional complexity necessary to track LRU past 2 entries.   */
+  #define FD_NET_ROUTE_CACHE_CNT 2
+  fd_net_route_cache_key_t keys[FD_NET_ROUTE_CACHE_CNT];
+  uint                     dst_ips[FD_NET_ROUTE_CACHE_CNT];
+  fd_route_decision_t      ops[FD_NET_ROUTE_CACHE_CNT];
+  uchar                    last_used_idx : 1; /* binary */
+};
+typedef struct fd_net_route_cache fd_net_route_cache_t;
+
+static inline void
+fd_net_route_cache_update( fd_net_route_cache_t *   cache,
+                           uint                     dst_ip,
+                           fd_net_route_cache_key_t key,
+                           fd_route_decision_t  *   route_res ) {
+  uint idx = (~cache->last_used_idx)&0x1;
+  cache->keys[idx] = key;
+  cache->dst_ips[idx] = dst_ip;
+  cache->ops[idx] = *route_res;
+  cache->last_used_idx = idx&0x1;
+}
+
 FD_PROTOTYPES_BEGIN
 
 /* fd_net_flusher_inc marks a new packet as enqueued. */
@@ -185,15 +232,11 @@ typedef struct {
 
   /* Details pertaining to an inflight send op */
   struct {
-    uint   xsk_idx;
-    void * frame;
-    uchar  mac_addrs[12];     /* First 12 bytes of Ethernet header */
-    uint   src_ip;            /* src_ip in net order */
-
-    uint   use_gre;           /* The tx packet will be GRE-encapsulated */
-    uint   gre_outer_src_ip;  /* For GRE: Outer iphdr's src_ip in net order */
-    uint   gre_outer_dst_ip;  /* For GRE: Outer iphdr's dst_ip in net order */
+    void              * frame;
+    fd_route_decision_t route_res;
   } tx_op;
+
+  fd_net_route_cache_t route_cache;
 
   /* Round-robin cycle serivce operations */
   uint rr_idx;
@@ -553,6 +596,16 @@ net_tx_route( fd_net_ctx_t * ctx,
               uint *         is_gre_inf ) {
 
   /* Route lookup */
+  fd_net_route_cache_t * route_cache = &ctx->route_cache;
+  fd_route_decision_t  * route_res = &ctx->tx_op.route_res;
+
+  for( uint i=0; i<FD_NET_ROUTE_CACHE_CNT; i++ ) {
+    if( FD_LIKELY( route_cache->dst_ips[i] == dst_ip ) ) {
+      *route_res = route_cache->ops[i];
+      route_cache->last_used_idx = i&0x1;
+      return 1;
+    }
+  }
 
   fd_fib4_hop_t hop[2] = {0};
   hop[0] = fd_fib4_lookup( ctx->fib_local, dst_ip, 0UL );
@@ -562,6 +615,19 @@ net_tx_route( fd_net_ctx_t * ctx,
   uint rtype   = next_hop->rtype;
   uint if_idx  = next_hop->if_idx;
   uint ip4_src = next_hop->ip4_src;
+
+  fd_net_route_cache_key_t net_cache_query = (fd_net_route_cache_key_t) {
+    .rtype = rtype,
+    .if_idx = if_idx,
+  };
+  for( uint i=0; i<FD_NET_ROUTE_CACHE_CNT; i++ ) {
+    if( FD_LIKELY( route_cache->keys[i].key == net_cache_query.key ) ) {
+      *route_res = route_cache->ops[i];
+      route_cache->dst_ips[i] = dst_ip; /* we missed on dst_ip, so update its key */
+      route_cache->last_used_idx = i&0x1;
+      return 1;
+    }
+  }
 
   if( FD_UNLIKELY( rtype==FD_FIB4_RTYPE_LOCAL ) ) {
     rtype  = FD_FIB4_RTYPE_UNICAST;
@@ -580,23 +646,25 @@ net_tx_route( fd_net_ctx_t * ctx,
   }
 
   ip4_src = fd_uint_if( !!ctx->bind_address, ctx->bind_address, ip4_src );
-  ctx->tx_op.src_ip  = ip4_src;
-  ctx->tx_op.xsk_idx = UINT_MAX;
+  route_res->src_ip  = ip4_src;
+  route_res->xsk_idx = UINT_MAX;
 
   FD_TEST( is_gre_inf );
   *is_gre_inf = 0;
   if( netdev->dev_type==ARPHRD_LOOPBACK ) {
     /* Set Ethernet src and dst address to 00:00:00:00:00:00 */
-    memset( ctx->tx_op.mac_addrs, 0, 12UL );
-    ctx->tx_op.xsk_idx = XSK_IDX_LO;
+    memset( route_res->mac_addrs, 0, 12UL );
+    route_res->xsk_idx = XSK_IDX_LO;
     /* Set preferred src address to 127.0.0.1 if no bind address is set */
-    if( !ctx->tx_op.src_ip ) ctx->tx_op.src_ip = FD_IP4_ADDR( 127,0,0,1 );
+    if( !route_res->src_ip ) route_res->src_ip = FD_IP4_ADDR( 127,0,0,1 );
+    fd_net_route_cache_update( &ctx->route_cache, dst_ip, net_cache_query, route_res );
     return 1;
   } else if( netdev->dev_type==ARPHRD_IPGRE ) {
     /* skip MAC addrs lookup for GRE inner dst ip */
-    if( netdev->gre_src_ip ) ctx->tx_op.gre_outer_src_ip = netdev->gre_src_ip;
-    ctx->tx_op.gre_outer_dst_ip = netdev->gre_dst_ip;
+    if( netdev->gre_src_ip ) route_res->gre_outer_src_ip = netdev->gre_src_ip;
+    route_res->gre_outer_dst_ip = netdev->gre_dst_ip;
     *is_gre_inf = 1;
+    fd_net_route_cache_update( &ctx->route_cache, dst_ip, net_cache_query, route_res );
     return 1;
   }
 
@@ -606,7 +674,7 @@ net_tx_route( fd_net_ctx_t * ctx,
     ctx->metrics.tx_no_xdp_cnt++;
     return 0;
   }
-  ctx->tx_op.xsk_idx = XSK_IDX_MAIN;
+  route_res->xsk_idx = XSK_IDX_MAIN;
 
   /* Neighbor resolve */
   uint neigh_ip = next_hop->ip4_gw;
@@ -625,9 +693,11 @@ net_tx_route( fd_net_ctx_t * ctx,
     return 0;
   }
   ip4_src = fd_uint_if( !ip4_src, ctx->default_address, ip4_src );
-  ctx->tx_op.src_ip = ip4_src;
-  memcpy( ctx->tx_op.mac_addrs+0, neigh->mac_addr, 6 );
-  memcpy( ctx->tx_op.mac_addrs+6, netdev->mac_addr,  6 );
+  route_res->src_ip = ip4_src;
+  memcpy( route_res->mac_addrs+0, neigh->mac_addr, 6 );
+  memcpy( route_res->mac_addrs+6, netdev->mac_addr,  6 );
+
+  fd_net_route_cache_update( &ctx->route_cache, dst_ip, net_cache_query, route_res );
 
   return 1;
 }
@@ -660,28 +730,28 @@ before_frag( fd_net_ctx_t * ctx,
 
   if( net_tile_id!=0 && net_tile_id!=target_idx ) return 1; /* ignore */
 
-
-  ctx->tx_op.use_gre          = 0;
-  ctx->tx_op.gre_outer_dst_ip = 0;
-  ctx->tx_op.gre_outer_src_ip = 0;
+  fd_route_decision_t * route_res = &ctx->tx_op.route_res;
+  route_res->use_gre          = 0;
+  route_res->gre_outer_dst_ip = 0;
+  route_res->gre_outer_src_ip = 0;
   uint is_gre_inf             = 0;
 
   if( FD_UNLIKELY( !net_tx_route( ctx, dst_ip, &is_gre_inf ) ) ) {
     return 1; /* metrics incremented by net_tx_route */
   }
 
-  uint xsk_idx     = ctx->tx_op.xsk_idx;
+  uint xsk_idx = route_res->xsk_idx;
 
   if( is_gre_inf ) {
-    uint inner_src_ip = ctx->tx_op.src_ip;
+    uint inner_src_ip = route_res->src_ip;
     if( FD_UNLIKELY( !inner_src_ip ) ) {
       ctx->metrics.tx_gre_route_fail_cnt++;
       return 1;
     }
     /* Find the MAC addrs for the eth hdr, and src ip for outer ip4 hdr if not found in netdev tbl */
-    ctx->tx_op.src_ip  = 0;
+    route_res->src_ip  = 0;
     is_gre_inf         = 0;
-    if( FD_UNLIKELY( !net_tx_route( ctx, ctx->tx_op.gre_outer_dst_ip, &is_gre_inf ) ) ) {
+    if( FD_UNLIKELY( !net_tx_route( ctx, route_res->gre_outer_dst_ip, &is_gre_inf ) ) ) {
       ctx->metrics.tx_gre_route_fail_cnt++;
       return 1;
     }
@@ -690,11 +760,11 @@ before_frag( fd_net_ctx_t * ctx,
       ctx->metrics.tx_gre_route_fail_cnt++;
       return 1;
     }
-    if( !ctx->tx_op.gre_outer_src_ip ) {
-      ctx->tx_op.gre_outer_src_ip = ctx->tx_op.src_ip;
+    if( !route_res->gre_outer_src_ip ) {
+      route_res->gre_outer_src_ip = route_res->src_ip;
     }
-    ctx->tx_op.use_gre = 1; /* indicate to during_frag to use GRE header */
-    ctx->tx_op.src_ip  = inner_src_ip;
+    route_res->use_gre = 1; /* indicate to during_frag to use GRE header */
+    route_res->src_ip  = inner_src_ip;
     xsk_idx = XSK_IDX_MAIN;
   }
 
@@ -759,7 +829,7 @@ during_frag( fd_net_ctx_t * ctx,
   /* Speculatively copy frame into XDP buffer */
   uchar const * src = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
 
-  if( ctx->tx_op.use_gre ) {
+  if( ctx->tx_op.route_res.use_gre ) {
     /* Discard the ethernet hdr from src. Copy the rest to where the inner ip4_hdr is.
        Safe from overflow: FD_ETH_PAYLOAD_MAX + header overhead < frame size (2048UL) */
     ulong overhead = sizeof(fd_eth_hdr_t) + sizeof(fd_ip4_hdr_t) + sizeof(fd_gre_hdr_t);
@@ -784,18 +854,19 @@ after_frag( fd_net_ctx_t *      ctx,
 
   /* Current send operation */
 
+  fd_route_decision_t const * route_res = &ctx->tx_op.route_res;
   uchar *    frame   = ctx->tx_op.frame;
-  uint       xsk_idx = ctx->tx_op.xsk_idx;
+  uint       xsk_idx = route_res->xsk_idx;
 
   /* Select Ethernet addresses */
-  memcpy( frame, ctx->tx_op.mac_addrs, 12 );
+  memcpy( frame, route_res->mac_addrs, 12 );
 
   uchar * iphdr = frame + sizeof(fd_eth_hdr_t);
 
-  if( ctx->tx_op.use_gre ) {
+  if( route_res->use_gre ) {
 
     /* For GRE packets, the ethertype will always be FD_ETH_HDR_TYPE_IP. outer source ip can't be 0 */
-    if( FD_UNLIKELY( ctx->tx_op.gre_outer_src_ip==0 ) ) {
+    if( FD_UNLIKELY( route_res->gre_outer_src_ip==0 ) ) {
       ctx->metrics.tx_gre_route_fail_cnt++;
       return;
     }
@@ -820,8 +891,8 @@ after_frag( fd_net_ctx_t *      ctx,
       .ttl          = 64,
       .protocol     = FD_IP4_HDR_PROTOCOL_GRE,
       .check        = 0,
-      .saddr        = ctx->tx_op.gre_outer_src_ip,
-      .daddr        = ctx->tx_op.gre_outer_dst_ip,
+      .saddr        = route_res->gre_outer_src_ip,
+      .daddr        = route_res->gre_outer_dst_ip,
     };
     ip4_outer.check = fd_ip4_hdr_check_fast( &ip4_outer );
     FD_STORE( fd_ip4_hdr_t, outer_iphdr, ip4_outer );
@@ -855,7 +926,7 @@ after_frag( fd_net_ctx_t *      ctx,
   }
 
   if( ip4_saddr==0 ) {
-    if( FD_UNLIKELY( ctx->tx_op.src_ip==0 ||
+    if( FD_UNLIKELY( route_res->src_ip==0 ||
                      ihl<sizeof(fd_ip4_hdr_t) ||
                      (sizeof(fd_eth_hdr_t)+ihl)>sz ) ) {
       /* Outgoing IPv4 packet with unknown src IP or invalid IHL */
@@ -864,7 +935,7 @@ after_frag( fd_net_ctx_t *      ctx,
       return;
     }
     /* Recompute checksum after changing header */
-    FD_STORE( uint,   iphdr+12, ctx->tx_op.src_ip );
+    FD_STORE( uint,   iphdr+12, route_res->src_ip );
     FD_STORE( ushort, iphdr+10, 0 );
     FD_STORE( ushort, iphdr+10, fd_ip4_hdr_check( iphdr ) );
   }
@@ -892,7 +963,7 @@ after_frag( fd_net_ctx_t *      ctx,
   tx_ring->cached_prod = tx_seq+1U;
   ctx->metrics.tx_submit_cnt++;
   ctx->metrics.tx_bytes_total += sz;
-  if( ctx->tx_op.use_gre ) ctx->metrics.tx_gre_cnt++;
+  if( route_res->use_gre ) ctx->metrics.tx_gre_cnt++;
   fd_net_flusher_inc( ctx->tx_flusher+xsk_idx, fd_tickcount() );
 }
 

@@ -555,41 +555,42 @@ quic_bf_check( fd_tile_test_ctx_t * test_ctx,
     FD_LOG_WARNING(( "tx frame not assigned" ));
     return -1;
   }
-  if( ctx->tx_op.use_gre!=test_ctx->locals->tx_is_gre ) {
-    FD_LOG_WARNING(( "GRE routing logic failed: %u, %u", ctx->tx_op.use_gre, test_ctx->locals->tx_is_gre ));
+  fd_net_route_value_t const * route_res = &ctx->tx_op.route_res;
+  if( route_res->use_gre!=test_ctx->locals->tx_is_gre ) {
+    FD_LOG_WARNING(( "GRE routing logic failed: %u, %u", route_res->use_gre, test_ctx->locals->tx_is_gre ));
     return -1;
   }
 
   pkt_t * exp_out = (pkt_t *)(test_ctx->locals->tx_output);
-  if( !fd_memeq( ctx->tx_op.mac_addrs,   exp_out->eth.dst, 6) ) {
+  if( !fd_memeq( route_res->mac_addrs,   exp_out->eth.dst, 6) ) {
     FD_LOG_WARNING(( "routing failed. ethernet mac addrs destination unmatched" ));
-    FD_LOG_HEXDUMP_WARNING(( "tx_op.mac_addrs destination",    ctx->tx_op.mac_addrs, 6 ));
+    FD_LOG_HEXDUMP_WARNING(( "tx_op.mac_addrs destination",    route_res->mac_addrs, 6 ));
     FD_LOG_HEXDUMP_WARNING(( "expected mac_addrs destination", exp_out->eth.dst,     6 ));
     return -1;
   }
-  if( !fd_memeq( ctx->tx_op.mac_addrs+6,   exp_out->eth.src, 6) ) {
+  if( !fd_memeq( route_res->mac_addrs+6,   exp_out->eth.src, 6) ) {
     FD_LOG_WARNING(( "routing failed. ethernet mac addrs source unmatched" ));
-    FD_LOG_HEXDUMP_WARNING(( "tx_op.mac_addrs source",    ctx->tx_op.mac_addrs+6, 6 ));
+    FD_LOG_HEXDUMP_WARNING(( "tx_op.mac_addrs source",    route_res->mac_addrs+6, 6 ));
     FD_LOG_HEXDUMP_WARNING(( "expected mac_addrs source", exp_out->eth.src,       6 ));
     return -1;
   }
   if( test_ctx->locals->tx_is_gre ) {
     gre_pkt_t * gre_exp_out = (gre_pkt_t *)exp_out;
-    if( ctx->tx_op.src_ip!=gre_exp_out->inner_ip4.saddr ) {
-      FD_LOG_WARNING(( "inner src ip unmatched. %u, %u", ctx->tx_op.src_ip, gre_exp_out->inner_ip4.saddr ));
+    if( route_res->src_ip!=gre_exp_out->inner_ip4.saddr ) {
+      FD_LOG_WARNING(( "inner src ip unmatched. %u, %u", route_res->src_ip, gre_exp_out->inner_ip4.saddr ));
       return -1;
     }
-    if( ctx->tx_op.gre_outer_src_ip!=gre_exp_out->outer_ip4.saddr ) {
-      FD_LOG_WARNING(( "outer src ip unmatched. %u, %u", ctx->tx_op.gre_outer_src_ip, gre_exp_out->outer_ip4.saddr ));
+    if( route_res->gre_outer_src_ip!=gre_exp_out->outer_ip4.saddr ) {
+      FD_LOG_WARNING(( "outer src ip unmatched. %u, %u", route_res->gre_outer_src_ip, gre_exp_out->outer_ip4.saddr ));
       return -1;
     }
-    if( ctx->tx_op.gre_outer_dst_ip!=gre_exp_out->outer_ip4.daddr ) {
-      FD_LOG_WARNING(( "outer dst ip unmatched. %u, %u", ctx->tx_op.gre_outer_dst_ip, gre_exp_out->outer_ip4.daddr ));
+    if( route_res->gre_outer_dst_ip!=gre_exp_out->outer_ip4.daddr ) {
+      FD_LOG_WARNING(( "outer dst ip unmatched. %u, %u", route_res->gre_outer_dst_ip, gre_exp_out->outer_ip4.daddr ));
       return -1;
     }
   } else {
-    if( ctx->tx_op.src_ip!=exp_out->ip4.saddr ) {
-      FD_LOG_WARNING(( "src ip unmatched. %u, %u", ctx->tx_op.src_ip, exp_out->ip4.saddr ));
+    if( route_res->src_ip!=exp_out->ip4.saddr ) {
+      FD_LOG_WARNING(( "src ip unmatched. %u, %u", route_res->src_ip, exp_out->ip4.saddr ));
       return -1;
     }
   }
