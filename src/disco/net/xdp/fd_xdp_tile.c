@@ -52,6 +52,11 @@
 #define XSK_IDX_MAIN 0
 #define XSK_IDX_LO   1
 
+/* FD_XDP_COMP_BUDGET is the maximum number of frames that can be
+   consumed in a single call to net_comp_event. */
+
+#define FD_XDP_COMP_BUDGET (32UL)
+
 /* fd_net_in_ctx_t contains consumer information for an incoming tango
    link.  It is used as part of the TX path. */
 
@@ -1044,40 +1049,49 @@ net_rx_packet( fd_net_ctx_t * ctx,
   ctx->metrics.rx_bytes_total += sz;
 }
 
-/* net_comp_event is called when an XDP TX frame is free again. */
+/* net_comp_event is called when an XDP TX frame is free again.
+   It returns the number of frames that were successfully processed. */
 
 static void
 net_comp_event( fd_net_ctx_t * ctx,
                 fd_xsk_t *     xsk,
-                uint           comp_seq ) {
+                uint           comp_seq,
+                uint           comp_cnt ) {
 
   /* Locate the incoming frame */
 
   fd_xdp_ring_t * comp_ring  = &xsk->ring_cr;
   uint            comp_mask  = comp_ring->depth - 1U;
-  ulong           frame      = FD_VOLATILE_CONST( comp_ring->frame_ring[ comp_seq&comp_mask ] );
-  ulong const     frame_mask = FD_NET_MTU - 1UL;
-  if( FD_UNLIKELY( frame+FD_NET_MTU > ctx->umem_sz ) ) {
-    FD_LOG_ERR(( "Bounds check failed: frame=0x%lx umem_sz=0x%lx",
-                 frame, (ulong)ctx->umem_sz ));
-  }
 
-  /* Check if we have space to return the freed frame */
+  /* Check how much space we have to return the frame */
 
   fd_net_free_ring_t * free      = &ctx->free_tx;
   ulong                free_prod = free->prod;
   ulong                free_mask = free->depth - 1UL;
-  ulong                free_cons = free->cons;
-  long                 free_cnt = fd_seq_diff( free_prod, free_cons );
-  FD_TEST( free_prod >= free_cons );
-  if( FD_UNLIKELY( free_cnt>=(long)free->depth ) ) return; /* blocked */
+  long                 free_occ  = fd_seq_diff( free_prod, free->cons );
+  long                 avail_cnt = (long)(free->depth) - free_occ;
 
-  free->queue[ free_prod&free_mask ] = (ulong)ctx->umem + (frame & (~frame_mask));
-  free->prod = fd_seq_inc( free_prod, 1UL );
+  if( FD_UNLIKELY( avail_cnt <= 0 ) ) return; /* blocked */
 
-  /* Wind up for next iteration */
+  comp_cnt      = fd_uint_min( comp_cnt, (uint)avail_cnt );
 
-  comp_ring->cached_cons = comp_seq+1U;
+  ulong const frame_mask = FD_NET_MTU - 1UL;
+  for( ulong i = 0; i < comp_cnt; i++ ) {
+    ulong frame = FD_VOLATILE_CONST( comp_ring->frame_ring[ comp_seq&comp_mask ] );
+    if( FD_UNLIKELY( frame+FD_NET_MTU > ctx->umem_sz ) ) {
+      FD_LOG_ERR(( "Bounds check failed: frame=0x%lx umem_sz=0x%lx",
+                   frame, (ulong)ctx->umem_sz ));
+    }
+    free->queue[ free_prod&free_mask ] = (ulong)ctx->umem + (frame & (~frame_mask));
+    free_prod++;
+    comp_seq++;
+  }
+
+  free->prod             = free_prod;
+  comp_ring->cached_cons = comp_seq;
+
+  FD_VOLATILE( *comp_ring->cons ) = comp_ring->cached_cons = comp_seq;
+
   ctx->metrics.tx_complete_cnt++;
 }
 
@@ -1192,7 +1206,9 @@ before_credit( fd_net_ctx_t *      ctx,
   if( comp_cons!=comp_prod ) {
     *charge_busy = 1;
     rr_xsk->ring_cr.cached_prod = comp_prod;
-    net_comp_event( ctx, rr_xsk, comp_cons );
+    uint comp_cnt = fd_uint_min( comp_prod-comp_cons, FD_XDP_COMP_BUDGET );
+    FD_LOG_INFO(( "comp_cnt=%u", comp_cnt ));
+    net_comp_event( ctx, rr_xsk, comp_cons, comp_cnt );
   }
 }
 
